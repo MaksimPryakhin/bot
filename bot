@@ -1,0 +1,1143 @@
+import sqlite3
+import telebot
+from datetime import datetime
+from telebot import types
+from datetime import datetime, timedelta
+import os
+
+# Инициализация бота
+bot = telebot.TeleBot('8016934708:AAE1VoVqm1blhk0B-hRW6CbP_CpwoUx0T7E')  # Замените на ваш токен
+
+# Глобальная переменная для хранения состояний пользователей
+user_states = {}
+
+# Инициализация базы данных
+def init_db():
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    
+    # Создание таблицы пользователей
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        chat_id INTEGER UNIQUE,
+        phone TEXT,
+        name TEXT,
+        password TEXT
+    )
+    ''')
+    
+    # Создание таблицы мероприятий
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY,
+        title TEXT,
+        date TEXT,
+        price INTEGER,
+        description TEXT,
+        image_path TEXT
+    )
+    ''')
+    
+    # Создание таблицы билетов
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS tickets (
+        user_id INTEGER,
+        event_id INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users (id),
+        FOREIGN KEY (event_id) REFERENCES events (id),
+        PRIMARY KEY (user_id, event_id)
+    )
+    ''')
+    
+    # Создание таблицы списков пользователей
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS user_lists (
+        user_id INTEGER UNIQUE,
+        is_blacklisted BOOLEAN DEFAULT 0,
+        is_whitelisted BOOLEAN DEFAULT 0,
+        FOREIGN KEY (user_id) REFERENCES users (id)
+    )
+    ''')
+    cursor.execute("PRAGMA table_info(events)")
+    columns = [column[1] for column in cursor.fetchall()]
+    
+    if 'image_path' not in columns:
+        cursor.execute("ALTER TABLE events ADD COLUMN image_path TEXT")
+    conn.commit()
+    conn.close()
+
+# Инициализация базы данных при запуске
+init_db()
+
+# ID администратора 
+ADMIN_ID = 818795162  # Замените на ваш ID
+
+# Папка для хранения изображений
+IMAGE_FOLDER = 'event_images'
+if not os.path.exists(IMAGE_FOLDER):
+    os.makedirs(IMAGE_FOLDER)
+
+# Функция для автоматического удаления билетов на прошедшие мероприятия
+def cleanup_past_events():
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    # Находим ID прошедших мероприятий
+    cursor.execute("SELECT id FROM events WHERE date < ?", (today,))
+    past_event_ids = [row[0] for row in cursor.fetchall()]
+    
+    if past_event_ids:
+        # Удаляем билеты на эти мероприятия
+        cursor.executemany(
+            "DELETE FROM tickets WHERE event_id = ?",
+            [(event_id,) for event_id in past_event_ids]
+        )
+        conn.commit()
+    
+    conn.close()
+
+# Вызываем очистку при запуске
+cleanup_past_events()
+
+# Функции для работы с базой данных
+
+def get_user(chat_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def get_user_by_phone(phone):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE phone = ?", (phone,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def add_user(chat_id, phone, name, password):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO users (chat_id, phone, name, password) VALUES (?, ?, ?, ?)",
+            (chat_id, phone, name, password)
+        )
+        user_id = cursor.lastrowid
+        conn.commit()
+        return user_id
+    except sqlite3.IntegrityError:
+        return None
+    finally:
+        conn.close()
+
+def get_upcoming_events():
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+    cursor.execute("SELECT * FROM events WHERE date >= ? ORDER BY date LIMIT 10", (today,))
+    events = cursor.fetchall()
+    conn.close()
+    return events
+
+def get_event(event_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM events WHERE id = ?", (event_id,))
+    event = cursor.fetchone()
+    conn.close()
+    return event
+
+def add_event(title, date, price, description, image_path=None):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO events (title, date, price, description, image_path) VALUES (?, ?, ?, ?, ?)",
+            (title, date, price, description, image_path)
+        )
+        event_id = cursor.lastrowid
+        conn.commit()
+        return event_id
+    except Exception as e:
+        print(f"Error adding event: {e}")
+        return None
+    finally:
+        conn.close()
+
+def update_event_date(event_id, new_date):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE events SET date = ? WHERE id = ?",
+            (new_date, event_id)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error updating event date: {e}")
+        return False
+    finally:
+        conn.close()
+
+def update_event_image(event_id, image_path):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE events SET image_path = ? WHERE id = ?",
+            (image_path, event_id)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error updating event image: {e}")
+        return False
+    finally:
+        conn.close()
+
+def add_ticket(user_id, event_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    try:
+        # Проверяем, не в черном ли списке пользователь
+        cursor.execute("SELECT is_blacklisted FROM user_lists WHERE user_id = ?", (user_id,))
+        result = cursor.fetchone()
+        if result and result[0]:
+            return "blacklisted"
+        
+        cursor.execute(
+            "INSERT INTO tickets (user_id, event_id) VALUES (?, ?)",
+            (user_id, event_id)
+        )
+        conn.commit()
+        return "success"
+    except sqlite3.IntegrityError:
+        return "already_exists"
+    finally:
+        conn.close()
+
+def get_user_tickets(user_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT e.id, e.title, e.date, e.price 
+    FROM tickets t
+    JOIN events e ON t.event_id = e.id
+    WHERE t.user_id = ?
+    ''', (user_id,))
+    tickets = cursor.fetchall()
+    conn.close()
+    return tickets
+
+def is_user_whitelisted(user_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_whitelisted FROM user_lists WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result and result[0]
+
+def is_user_blacklisted(user_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_blacklisted FROM user_lists WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result and result[0]
+
+def add_to_blacklist(user_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT OR REPLACE INTO user_lists (user_id, is_blacklisted, is_whitelisted) VALUES (?, 1, 0)",
+            (user_id,)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error adding to blacklist: {e}")
+        return False
+    finally:
+        conn.close()
+
+def add_to_whitelist(user_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT OR REPLACE INTO user_lists (user_id, is_whitelisted, is_blacklisted) VALUES (?, 1, 0)",
+            (user_id,)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error adding to whitelist: {e}")
+        return False
+    finally:
+        conn.close()
+
+def remove_from_lists(user_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM user_lists WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error removing from lists: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_user_by_id(user_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def refund_ticket(user_id, event_id):
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    try:
+        # Проверяем, есть ли такой билет у пользователя
+        cursor.execute("""
+            SELECT 1 FROM tickets 
+            WHERE user_id = ? AND event_id = ?
+        """, (user_id, event_id))
+        if not cursor.fetchone():
+            return "not_found"
+        
+        # Получаем дату мероприятия
+        cursor.execute("SELECT date FROM events WHERE id = ?", (event_id,))
+        event_date_str = cursor.fetchone()[0]
+        event_date = datetime.strptime(event_date_str, '%Y-%m-%d').date()
+        
+        # Проверяем, что до мероприятия осталось более 7 дней
+        today = datetime.now().date()
+        days_until_event = (event_date - today).days
+        
+        if days_until_event < 7:
+            return "too_late"
+        
+        # Удаляем билет
+        cursor.execute("""
+            DELETE FROM tickets 
+            WHERE user_id = ? AND event_id = ?
+        """, (user_id, event_id))
+        conn.commit()
+        return "success"
+    except Exception as e:
+        print(f"Error refunding ticket: {e}")
+        return "error"
+    finally:
+        conn.close()
+
+# Обработчики команд
+@bot.message_handler(commands=['start'])
+def start(message):
+    user = get_user(message.chat.id)
+    if user:
+        if message.chat.id == ADMIN_ID:
+            show_admin_menu(message.chat.id, user[3])
+        else:
+            show_main_menu(message.chat.id, user[3])
+    else:
+        show_auth_menu(message.chat.id)
+
+def show_auth_menu(chat_id):
+    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    markup.add('Регистрация', 'Вход')
+    bot.send_message(chat_id, 'Привет! Выберите действие:', reply_markup=markup)
+
+def show_main_menu(chat_id, name=None):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('📅 Ближайшие мероприятия', '🎫 Мои билеты')
+    markup.add('💬 Написать в поддержку', '🚪 Выйти из аккаунта')
+    text = f"Привет, {name}!" if name else "Главное меню"
+    bot.send_message(chat_id, text, reply_markup=markup)
+
+def show_admin_menu(chat_id, name=None):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('📅 Ближайшие мероприятия', '🎫 Мои билеты')
+    markup.add('👥 Управление пользователями', '✏️ Управление мероприятиями', '🚪 Выйти из аккаунта')
+    text = f"Привет, Админ {name}!" if name else "Админ меню"
+    bot.send_message(chat_id, text, reply_markup=markup)
+
+@bot.message_handler(func=lambda message: message.text == '✏️ Управление мероприятиями' and message.chat.id == ADMIN_ID)
+def manage_events(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('◀️ Назад в меню', '➕ Добавить мероприятие')
+    bot.send_message(
+        message.chat.id,
+        "Выберите действие:",
+        reply_markup=markup
+    )
+    
+    # Показываем список мероприятий с кнопками редактирования
+    events = get_upcoming_events()
+    if not events:
+        bot.send_message(message.chat.id, "Нет мероприятий для редактирования.")
+        return
+    
+    markup = types.InlineKeyboardMarkup()
+    for event in events:
+        markup.add(types.InlineKeyboardButton(
+            text=f"✏️ {event[1]} ({event[2]})",
+            callback_data=f"edit_event_{event[0]}"
+        ))
+    
+    bot.send_message(message.chat.id, "Выберите мероприятие для редактирования:", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: message.text == '➕ Добавить мероприятие' and message.chat.id == ADMIN_ID)
+def add_event_start(message):
+    user_states[message.chat.id] = {'state': 'add_event_title'}
+    bot.send_message(message.chat.id, "Введите название мероприятия:", reply_markup=types.ForceReply())
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'add_event_title')
+def add_event_get_title(message):
+    user_states[message.chat.id] = {
+        'state': 'add_event_date',
+        'title': message.text
+    }
+    bot.send_message(message.chat.id, "Введите дату мероприятия в формате ГГГГ-ММ-ДД:")
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'add_event_date')
+def add_event_get_date(message):
+    try:
+        # Проверяем корректность даты
+        datetime.strptime(message.text, '%Y-%m-%d')
+        user_states[message.chat.id] = {
+            'state': 'add_event_price',
+            'title': user_states[message.chat.id]['title'],
+            'date': message.text
+        }
+        bot.send_message(message.chat.id, "Введите цену билета (целое число):")
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Неверный формат даты. Используйте ГГГГ-ММ-ДД")
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'add_event_price')
+def add_event_get_price(message):
+    if not message.text.isdigit():
+        bot.send_message(message.chat.id, "❌ Цена должна быть целым числом. Попробуйте еще раз:")
+        return
+    
+    user_states[message.chat.id] = {
+        'state': 'add_event_description',
+        'title': user_states[message.chat.id]['title'],
+        'date': user_states[message.chat.id]['date'],
+        'price': int(message.text)
+    }
+    bot.send_message(message.chat.id, "Введите описание мероприятия:")
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'add_event_description')
+def add_event_get_description(message):
+    user_states[message.chat.id] = {
+        'state': 'add_event_image',
+        'title': user_states[message.chat.id]['title'],
+        'date': user_states[message.chat.id]['date'],
+        'price': user_states[message.chat.id]['price'],
+        'description': message.text
+    }
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('Пропустить')
+    bot.send_message(
+        message.chat.id,
+        "Отправьте изображение для мероприятия или нажмите 'Пропустить':",
+        reply_markup=markup
+    )
+
+@bot.message_handler(content_types=['photo'], func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'add_event_image')
+def add_event_save_with_image(message):
+    try:
+        # Получаем данные мероприятия
+        event_data = user_states[message.chat.id]
+        
+        # Получаем файл изображения
+        file_id = message.photo[-1].file_id
+        file_info = bot.get_file(file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # Сохраняем изображение
+        image_path = os.path.join(IMAGE_FOLDER, f"event_{datetime.now().timestamp()}.jpg")
+        with open(image_path, 'wb') as new_file:
+            new_file.write(downloaded_file)
+        
+        # Добавляем мероприятие в БД
+        event_id = add_event(
+            event_data['title'],
+            event_data['date'],
+            event_data['price'],
+            event_data['description'],
+            image_path
+        )
+        
+        if event_id:
+            bot.send_message(
+                message.chat.id,
+                f"✅ Мероприятие '{event_data['title']}' успешно добавлено с изображением!",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
+            show_admin_menu(message.chat.id)
+        else:
+            bot.send_message(message.chat.id, "❌ Ошибка при добавлении мероприятия")
+    except Exception as e:
+        print(f"Error adding event with image: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка при добавлении мероприятия")
+    finally:
+        if 'state' in user_states.get(message.chat.id, {}):
+            del user_states[message.chat.id]
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'add_event_image' and message.text == 'Пропустить')
+def add_event_save_without_image(message):
+    try:
+        # Получаем данные мероприятия
+        event_data = user_states[message.chat.id]
+        
+        # Добавляем мероприятие в БД без изображения
+        event_id = add_event(
+            event_data['title'],
+            event_data['date'],
+            event_data['price'],
+            event_data['description']
+        )
+        
+        if event_id:
+            bot.send_message(
+                message.chat.id,
+                f"✅ Мероприятие '{event_data['title']}' успешно добавлено без изображения!",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
+            show_admin_menu(message.chat.id)
+        else:
+            bot.send_message(message.chat.id, "❌ Ошибка при добавлении мероприятия")
+    except Exception as e:
+        print(f"Error adding event without image: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка при добавлении мероприятия")
+    finally:
+        if 'state' in user_states.get(message.chat.id, {}):
+            del user_states[message.chat.id]
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('edit_event_'))
+def edit_event(call):
+    event_id = int(call.data.split('_')[2])
+    event = get_event(event_id)
+    
+    if not event:
+        bot.answer_callback_query(call.id, "Мероприятие не найдено")
+        return
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        text="📅 Изменить дату",
+        callback_data=f"edit_date_{event_id}"
+    ))
+    markup.add(types.InlineKeyboardButton(
+        text="🖼️ Изменить изображение",
+        callback_data=f"edit_image_{event_id}"
+    ))
+    markup.add(types.InlineKeyboardButton(
+        text="◀️ Назад",
+        callback_data="back_to_events"
+    ))
+    
+    # Показываем текущее изображение, если оно есть
+    if event[5]:  # image_path
+        try:
+            with open(event[5], 'rb') as photo:
+                bot.send_photo(
+                    call.message.chat.id,
+                    photo,
+                    caption=f"Редактирование: {event[1]}\nДата: {event[2]}\nВыберите действие:",
+                    reply_markup=markup
+                )
+        except Exception as e:
+            print(f"Error sending photo: {e}")
+            bot.send_message(
+                call.message.chat.id,
+                f"Редактирование: {event[1]}\nДата: {event[2]}\nВыберите действие:",
+                reply_markup=markup
+            )
+    else:
+        bot.send_message(
+            call.message.chat.id,
+            f"Редактирование: {event[1]}\nДата: {event[2]}\nИзображение: отсутствует\nВыберите действие:",
+            reply_markup=markup
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('edit_date_'))
+def edit_event_date(call):
+    event_id = int(call.data.split('_')[2])
+    user_states[call.message.chat.id] = {
+        'state': 'waiting_event_date',
+        'event_id': event_id
+    }
+    
+    bot.send_message(
+        call.message.chat.id,
+        "Введите новую дату мероприятия в формате ГГГГ-ММ-ДД (например, 2026-12-31):",
+        reply_markup=types.ForceReply()
+    )
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'waiting_event_date')
+def save_event_date(message):
+    event_id = user_states[message.chat.id]['event_id']
+    new_date = message.text
+    
+    try:
+        # Проверяем корректность даты
+        datetime.strptime(new_date, '%Y-%m-%d')
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Неверный формат даты. Используйте ГГГГ-ММ-ДД")
+        return
+    
+    if update_event_date(event_id, new_date):
+        bot.send_message(message.chat.id, "✅ Дата мероприятия успешно обновлена!")
+        event = get_event(event_id)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(
+            text="◀️ Назад к редактированию",
+            callback_data=f"edit_event_{event_id}"
+        ))
+        bot.send_message(
+            message.chat.id,
+            f"Обновленная информация:\n{event[1]}\nДата: {new_date}",
+            reply_markup=markup
+        )
+    else:
+        bot.send_message(message.chat.id, "❌ Ошибка при обновлении даты")
+    
+    del user_states[message.chat.id]
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('edit_image_'))
+def edit_event_image(call):
+    event_id = int(call.data.split('_')[2])
+    user_states[call.message.chat.id] = {
+        'state': 'waiting_event_image',
+        'event_id': event_id
+    }
+    
+    bot.send_message(
+        call.message.chat.id,
+        "Отправьте новое изображение для мероприятия:",
+        reply_markup=types.ForceReply()
+    )
+
+@bot.message_handler(content_types=['photo'], func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'waiting_event_image')
+def save_event_image(message):
+    event_id = user_states[message.chat.id]['event_id']
+    
+    try:
+        # Получаем файл изображения
+        file_id = message.photo[-1].file_id
+        file_info = bot.get_file(file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # Сохраняем изображение
+        image_path = os.path.join(IMAGE_FOLDER, f"event_{event_id}_{file_id}.jpg")
+        with open(image_path, 'wb') as new_file:
+            new_file.write(downloaded_file)
+        
+        # Обновляем путь в базе данных
+        if update_event_image(event_id, image_path):
+            bot.send_message(message.chat.id, "✅ Изображение мероприятия успешно обновлено!")
+            event = get_event(event_id)
+            
+            # Показываем обновленное изображение
+            try:
+                with open(image_path, 'rb') as photo:
+                    markup = types.InlineKeyboardMarkup()
+                    markup.add(types.InlineKeyboardButton(
+                        text="◀️ Назад к редактированию",
+                        callback_data=f"edit_event_{event_id}"
+                    ))
+                    bot.send_photo(
+                        message.chat.id,
+                        photo,
+                        caption=f"Обновленное изображение для: {event[1]}",
+                        reply_markup=markup
+                    )
+            except Exception as e:
+                print(f"Error sending updated photo: {e}")
+                bot.send_message(message.chat.id, "Изображение обновлено, но не может быть показано.")
+        else:
+            bot.send_message(message.chat.id, "❌ Ошибка при обновлении изображения")
+    except Exception as e:
+        print(f"Error saving image: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка при сохранении изображения")
+    
+    del user_states[message.chat.id]
+
+@bot.callback_query_handler(func=lambda call: call.data == 'back_to_events')
+def back_to_events(call):
+    manage_events(call.message)
+
+@bot.message_handler(func=lambda message: message.text == '💬 Написать в поддержку')
+def contact_support(message):
+    user = get_user(message.chat.id)
+    if not user:
+        bot.send_message(message.chat.id, '🔒 Пожалуйста, сначала войдите в систему.')
+        return
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('◀️ Отмена')
+    bot.send_message(
+        message.chat.id,
+        "Напишите ваше сообщение для поддержки. Мы ответим вам как можно скорее:",
+        reply_markup=markup
+    )
+    user_states[message.chat.id] = {'state': 'waiting_support_message'}
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'waiting_support_message')
+def handle_support_message(message):
+    if message.text == '◀️ Отмена':
+        del user_states[message.chat.id]
+        show_main_menu(message.chat.id)
+        return
+    
+    user = get_user(message.chat.id)
+    if not user:
+        del user_states[message.chat.id]
+        bot.send_message(message.chat.id, '❌ Ошибка: пользователь не найден')
+        return
+    
+    # Отправляем сообщение администратору
+    try:
+        bot.send_message(
+            ADMIN_ID,
+            f"✉️ Новое сообщение от пользователя {user[3]} ({user[2]}):\n\n{message.text}\n\nID чата: {message.chat.id}"
+        )
+        bot.send_message(
+            message.chat.id,
+            "✅ Ваше сообщение отправлено в поддержку. Мы ответим вам в ближайшее время.",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        show_main_menu(message.chat.id, user[3])
+    except Exception as e:
+        bot.send_message(
+            message.chat.id,
+            "❌ Произошла ошибка при отправке сообщения. Пожалуйста, попробуйте позже."
+        )
+    finally:
+        del user_states[message.chat.id]
+
+@bot.message_handler(func=lambda message: message.text == '👥 Управление пользователями' and message.chat.id == ADMIN_ID)
+def manage_users(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('◀️ Назад в меню')
+    bot.send_message(
+        message.chat.id,
+        "Введите номер телефона пользователя (в формате 79998887766) для управления:",
+        reply_markup=markup
+    )
+    bot.register_next_step_handler(message, process_user_phone_for_management)
+
+def process_user_phone_for_management(message):
+    if message.text == '◀️ Назад в меню':
+        show_admin_menu(message.chat.id)
+        return
+    
+    phone = message.text
+    user = get_user_by_phone(phone)
+    
+    if not user:
+        bot.send_message(message.chat.id, "❌ Пользователь не найден.")
+        show_admin_menu(message.chat.id)
+        return
+    
+    user_id = user[0]
+    is_blacklisted = is_user_blacklisted(user_id)
+    is_whitelisted = is_user_whitelisted(user_id)
+    
+    markup = types.InlineKeyboardMarkup()
+    
+    if not is_blacklisted:
+        markup.add(types.InlineKeyboardButton(
+            text="⛔ Добавить в черный список",
+            callback_data=f"blacklist_{user_id}"
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
+            text="✅ Убрать из черного списка",
+            callback_data=f"unblacklist_{user_id}"
+        ))
+    
+    if not is_whitelisted:
+        markup.add(types.InlineKeyboardButton(
+            text="⭐ Добавить в белый список",
+            callback_data=f"whitelist_{user_id}"
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
+            text="🔻 Убрать из белого списка",
+            callback_data=f"unwhitelist_{user_id}"
+        ))
+    
+    bot.send_message(
+        message.chat.id,
+        f"Управление пользователем: {user[3]} ({user[2]})\n"
+        f"Статусы:\n"
+        f"Черный список: {'Да' if is_blacklisted else 'Нет'}\n"
+        f"Белый список: {'Да' if is_whitelisted else 'Нет'}",
+        reply_markup=markup
+    )
+    show_admin_menu(message.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('blacklist_', 'unblacklist_', 'whitelist_', 'unwhitelist_')))
+def handle_list_management(call):
+    action, user_id = call.data.split('_')
+    user_id = int(user_id)
+    
+    if call.message.chat.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ У вас нет прав для этого действия")
+        return
+    
+    if action == 'blacklist':
+        if add_to_blacklist(user_id):
+            bot.answer_callback_query(call.id, "✅ Пользователь добавлен в черный список")
+        else:
+            bot.answer_callback_query(call.id, "❌ Ошибка при добавлении в черный список")
+    
+    elif action == 'unblacklist':
+        if remove_from_lists(user_id):
+            bot.answer_callback_query(call.id, "✅ Пользователь убран из черного списка")
+        else:
+            bot.answer_callback_query(call.id, "❌ Ошибка при удалении из черного списка")
+    
+    elif action == 'whitelist':
+        if add_to_whitelist(user_id):
+            bot.answer_callback_query(call.id, "✅ Пользователь добавлен в белый список")
+        else:
+            bot.answer_callback_query(call.id, "❌ Ошибка при добавлении в белый список")
+    
+    elif action == 'unwhitelist':
+        if remove_from_lists(user_id):
+            bot.answer_callback_query(call.id, "✅ Пользователь убран из белого списка")
+        else:
+            bot.answer_callback_query(call.id, "❌ Ошибка при удалении из белого списка")
+    
+    # Обновляем сообщение
+    user = get_user_by_id(user_id)
+    is_blacklisted = is_user_blacklisted(user_id)
+    is_whitelisted = is_user_whitelisted(user_id)
+    
+    markup = types.InlineKeyboardMarkup()
+    
+    if not is_blacklisted:
+        markup.add(types.InlineKeyboardButton(
+            text="⛔ Добавить в черный список",
+            callback_data=f"blacklist_{user_id}"
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
+            text="✅ Убрать из черного списка",
+            callback_data=f"unblacklist_{user_id}"
+        ))
+    
+    if not is_whitelisted:
+        markup.add(types.InlineKeyboardButton(
+            text="⭐ Добавить в белый список",
+            callback_data=f"whitelist_{user_id}"
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
+            text="🔻 Убрать из белого списка",
+            callback_data=f"unwhitelist_{user_id}"
+        ))
+    
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=f"Управление пользователем: {user[3]} ({user[2]})\n"
+             f"Статусы:\n"
+             f"Черный список: {'Да' if is_blacklisted else 'Нет'}\n"
+             f"Белый список: {'Да' if is_whitelisted else 'Нет'}",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: message.text == 'Регистрация')
+def register_start(message):
+    user_states[message.chat.id] = {'state': 'waiting_phone'}
+    bot.send_message(message.chat.id, '📱 Введите ваш номер телефона (в формате 79998887766):', reply_markup=types.ForceReply())
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'waiting_phone')
+def register_get_phone(message):
+    if not message.text.isdigit() or len(message.text) != 11:
+        bot.send_message(message.chat.id, '❌ Некорректный номер телефона. Попробуйте еще раз:')
+        return
+    
+    user_states[message.chat.id] = {
+        'state': 'waiting_name',
+        'phone': message.text
+    }
+    bot.send_message(message.chat.id, '👤 Введите ваше имя:')
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'waiting_name')
+def register_get_name(message):
+    user_states[message.chat.id]['state'] = 'waiting_password'
+    user_states[message.chat.id]['name'] = message.text
+    bot.send_message(message.chat.id, '🔑 Придумайте пароль:')
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'waiting_password')
+def register_finish(message):
+    phone = user_states[message.chat.id]['phone']
+    name = user_states[message.chat.id]['name']
+    password = message.text
+    
+    if add_user(message.chat.id, phone, name, password):
+        del user_states[message.chat.id]
+        show_main_menu(message.chat.id, name)
+        bot.send_message(message.chat.id, '✅ Регистрация завершена!')
+    else:
+        bot.send_message(message.chat.id, '❌ Ошибка регистрации. Возможно, пользователь уже существует. /start')
+
+@bot.message_handler(func=lambda message: message.text == 'Вход')
+def login_start(message):
+    user_states[message.chat.id] = {'state': 'login_phone'}
+    bot.send_message(message.chat.id, '📱 Введите ваш номер телефона:')
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'login_phone')
+def login_get_phone(message):
+    user = get_user_by_phone(message.text)
+    
+    if user:
+        user_states[message.chat.id] = {
+            'state': 'login_password',
+            'phone': message.text,
+            'user_id': user[0]
+        }
+        bot.send_message(message.chat.id, '🔑 Введите пароль:')
+    else:
+        del user_states[message.chat.id]
+        bot.send_message(message.chat.id, '❌ Пользователь с таким номером телефона не найден.')
+
+@bot.message_handler(func=lambda message: user_states.get(message.chat.id, {}).get('state') == 'login_password')
+def login_check_password(message):
+    phone = user_states[message.chat.id]['phone']
+    user_id = user_states[message.chat.id]['user_id']
+    
+    conn = sqlite3.connect('events_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM users WHERE phone = ? AND password = ?", (phone, message.text))
+    user = cursor.fetchone()
+    conn.close()
+    
+    if user:
+        del user_states[message.chat.id]
+        if message.chat.id == ADMIN_ID:
+            show_admin_menu(message.chat.id, user[0])
+        else:
+            show_main_menu(message.chat.id, user[0])
+        bot.send_message(message.chat.id, '✅ Вход выполнен!')
+    else:
+        bot.send_message(message.chat.id, '❌ Неверный пароль. Попробуйте еще раз.')
+
+@bot.message_handler(func=lambda message: message.text == '🚪 Выйти из аккаунта')
+def logout(message):
+    bot.send_message(message.chat.id, "Вы вышли из аккаунта.")
+    show_auth_menu(message.chat.id)
+
+@bot.message_handler(func=lambda message: message.text == '📅 Ближайшие мероприятия')
+def show_upcoming_events(message):
+    # Очищаем прошедшие мероприятия перед показом
+    cleanup_past_events()
+    
+    user = get_user(message.chat.id)
+    if not user:
+        bot.send_message(message.chat.id, '🔒 Пожалуйста, сначала войдите в систему.')
+        return
+    
+    if is_user_blacklisted(user[0]):
+        bot.send_message(message.chat.id, '⛔ Вы в черном списке и не можете просматривать мероприятия.')
+        return
+    
+    events = get_upcoming_events()
+    
+    if not events:
+        bot.send_message(message.chat.id, 'ℹ️ На данный момент нет предстоящих мероприятий.')
+        return
+    
+    for event in events:
+        price = event[3]
+        
+        # Применяем скидку для пользователей из белого списка
+        if is_user_whitelisted(user[0]):
+            discount = int(price * 0.2)
+            price_text = f"<s>{price}</s> {price - discount} руб. (скидка 20%)"
+        else:
+            price_text = f"{price} руб."
+        
+        response = f"<b>🎭 {event[1]}</b>\n"
+        response += f"📅 <i>Дата:</i> {event[2]}\n"
+        response += f"💰 <i>Цена:</i> {price_text}\n"
+        response += f"ℹ️ <i>Описание:</i> {event[4]}\n\n"
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(
+            text="Купить билет",
+            callback_data=f"buy_{event[0]}"
+        ))
+        
+        # Если есть изображение, отправляем его с описанием
+        if event[5]:
+            try:
+                with open(event[5], 'rb') as photo:
+                    bot.send_photo(
+                        message.chat.id,
+                        photo,
+                        caption=response,
+                        parse_mode='HTML',
+                        reply_markup=markup
+                    )
+            except Exception as e:
+                print(f"Error sending photo: {e}")
+                bot.send_message(
+                    message.chat.id,
+                    response,
+                    parse_mode='HTML',
+                    reply_markup=markup
+                )
+        else:
+            bot.send_message(
+                message.chat.id,
+                response,
+                parse_mode='HTML',
+                reply_markup=markup
+            )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('buy_'))
+def buy_ticket(call):
+    user = get_user(call.message.chat.id)
+    if not user:
+        bot.answer_callback_query(call.id, "🔒 Пожалуйста, сначала войдите в систему")
+        return
+    
+    if is_user_blacklisted(user[0]):
+        bot.answer_callback_query(call.id, "⛔ Вы в черном списке и не можете покупать билеты")
+        return
+    
+    event_id = int(call.data.split('_')[1])
+    result = add_ticket(user[0], event_id)
+    
+    if result == "blacklisted":
+        bot.answer_callback_query(call.id, "⛔ Вы в черном списке и не можете покупать билеты")
+    elif result == "already_exists":
+        bot.answer_callback_query(call.id, "ℹ️ У вас уже есть билет на это мероприятие")
+    elif result == "success":
+        conn = sqlite3.connect('events_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT title, price FROM events WHERE id = ?", (event_id,))
+        event_title, price = cursor.fetchone()
+        conn.close()
+        
+        # Применяем скидку для пользователей из белого списка
+        if is_user_whitelisted(user[0]):
+            discount = int(price * 0.2)  # 20% скидка
+            bot.answer_callback_query(
+                call.id, 
+                f"✅ Вы купили билет на {event_title} со скидкой 20%! (-{discount} руб.)"
+            )
+        else:
+            bot.answer_callback_query(call.id, f"✅ Вы купили билет на {event_title}!")
+
+@bot.message_handler(func=lambda message: message.text == '🎫 Мои билеты')
+def show_user_events(message):
+    # Очищаем прошедшие мероприятия перед показом
+    cleanup_past_events()
+    
+    user = get_user(message.chat.id)
+    if not user:
+        bot.send_message(message.chat.id, '🔒 Пожалуйста, сначала войдите в систему.')
+        return
+    
+    tickets = get_user_tickets(user[0])
+    
+    if not tickets:
+        bot.send_message(message.chat.id, 'ℹ️ У вас пока нет купленных билетов.')
+        return
+    
+    response = "🎫 <b>Ваши билеты:</b>\n\n"
+    today = datetime.now().date()
+    markup = types.InlineKeyboardMarkup()
+    
+    for ticket in tickets:
+        event_id = ticket[0]
+        event_date = datetime.strptime(ticket[2], '%Y-%m-%d').date()
+        days_until_event = (event_date - today).days
+        
+        if event_date >= today:
+            status = "✅ Активен"
+            # Добавляем кнопку возврата только если до мероприятия более 7 дней
+            if days_until_event >= 7:
+                markup.add(types.InlineKeyboardButton(
+                    text=f"Вернуть билет: {ticket[1]}",
+                    callback_data=f"refund_{event_id}"
+                ))
+            else:
+                response += f"⚠️ <i>Возврат билета на '{ticket[1]}' невозможен (менее 7 дней до мероприятия)</i>\n\n"
+        else:
+            status = "❌ Прошедшее"
+        
+        response += f"<b>{ticket[1]}</b> {status}\n"
+        response += f"📅 Дата: {ticket[2]}\n"
+        response += f"💰 Цена: {ticket[3]} руб.\n"
+        if event_date >= today and days_until_event >= 7:
+            response += f"🔄 Можно вернуть до {event_date - timedelta(days=7)}\n"
+        response += "\n"
+    
+    bot.send_message(message.chat.id, response, parse_mode='HTML', reply_markup=markup)
+    
+@bot.callback_query_handler(func=lambda call: call.data.startswith('refund_'))
+def handle_refund(call):
+    user = get_user(call.message.chat.id)
+    if not user:
+        bot.answer_callback_query(call.id, "🔒 Пожалуйста, сначала войдите в систему")
+        return
+    
+    event_id = int(call.data.split('_')[1])
+    result = refund_ticket(user[0], event_id)
+    
+    if result == "not_found":
+        bot.answer_callback_query(call.id, "❌ Билет не найден")
+    elif result == "too_late":
+        # Получаем информацию о мероприятии для сообщения
+        conn = sqlite3.connect('events_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT title, date FROM events WHERE id = ?", (event_id,))
+        event_title, event_date = cursor.fetchone()
+        conn.close()
+        
+        bot.answer_callback_query(
+            call.id, 
+            f"❌ Возврат невозможен: до мероприятия '{event_title}' ({event_date}) осталось менее 7 дней"
+        )
+    elif result == "error":
+        bot.answer_callback_query(call.id, "❌ Ошибка при возврате билета")
+    elif result == "success":
+        # Получаем информацию о мероприятии для сообщения
+        conn = sqlite3.connect('events_bot.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT title FROM events WHERE id = ?", (event_id,))
+        event_title = cursor.fetchone()[0]
+        conn.close()
+        
+        bot.answer_callback_query(call.id, f"✅ Билет на {event_title} успешно возвращен!")
+        # Обновляем список билетов
+        show_user_events(call.message)
+
+@bot.message_handler(func=lambda message: True)
+def handle_other_messages(message):
+    bot.send_message(message.chat.id, '❌ Я вас не понимаю. Используйте кнопки меню или команду /start')
+
+if __name__ == '__main__':
+    print("🤖 Бот запущен...")
+    bot.polling(none_stop=True)
